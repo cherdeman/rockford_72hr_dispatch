@@ -2,6 +2,7 @@ import urllib.request
 import json
 import csv
 import psycopg2
+from psycopg2.extras import execute_batch
 import os
 import sys
 #import atexit
@@ -16,12 +17,11 @@ logger.setLevel(logging.INFO)
 # Pull all records, autolimit = 100
 url = 'https://data.illinois.gov/api/3/action/datastore_search?resource_id=5f783951-5f80-4fdd-8b5c-7c434933d7e3&limit=1000'
 
-#IMPLEMENT THESE FUNCTIONS
 class client:
     def __init__(self, override=False):
-        # you add class variables here like
-        # self.myvar="the greatest variable ever. the best"
-
+        self.batch_size = 100
+        self.batch_count = 0
+        self.dispatch_params = []
         self.conn = None
         try:
             with open('secrets.json') as f:
@@ -42,7 +42,6 @@ class client:
                                 password=self.dbpasswd,
                                 host=self.dbhost,
                                 port=self.dbport)
-        self.conn.set_session(autocommit=True)
 
         return True
 
@@ -60,6 +59,9 @@ class client:
         with self.conn.cursor() as cur:
             for statement in statements:
                     cur.execute(statement)
+
+        self.conn.commit()
+
 
     def read(self, statement, args):
         """Execute statement, fetchall returned rows."""
@@ -104,37 +106,6 @@ class client:
 
         return True
 
-    def addGeoExtensions(self):
-    	
-        CREATE_EXT_POSTGIS = """CREATE EXTENSION IF NOT EXISTS postgis;"""
-        CREATE_EXT_FUZZY = """create extension IF NOT EXISTS fuzzystrmatch;"""
-        CREATE_EXT_TIGER = """create extension IF NOT EXISTS postgis_tiger_geocoder;"""
-        CREATE_EXT_POSTGIS_TOP = """create extension IF NOT EXISTS postgis_topology;"""
-
-        self.write([
-            CREATE_EXT_POSTGIS,
-            CREATE_EXT_FUZZY,
-            CREATE_EXT_TIGER,
-            CREATE_EXT_POSTGIS_TOP
-            ])
-
-        return True
-
-    def removeGeoExtensions(self):
-
-        DROP_EXT_POSTGIS = """DROP EXTENSION IF EXISTS postgis CASCADE;"""
-        DROP_EXT_FUZZY = """DROP extension IF EXISTS fuzzystrmatch CASCADE;"""
-        DROP_EXT_TIGER = """DROP extension IF EXISTS postgis_tiger_geocoder CASCADE;"""
-        DROP_EXT_POSTGIS_TOP = """DROP extension IF EXISTS postgis_topology CASCADE;"""
-
-        self.write([
-            DROP_EXT_POSTGIS,
-            DROP_EXT_FUZZY,
-            DROP_EXT_TIGER,
-            DROP_EXT_POSTGIS_TOP
-            ])   	
-
-        return True
 
     def addIndexes(self):
         """Add at least two indexes to the tables to improve analytic queries."""
@@ -160,12 +131,44 @@ class client:
 
         records = data['result']['records']
 
+        dispatch_insert = """
+        INSERT INTO dispatch (_id, event_number, street_num, street_name, full_address, city, reporting_district, dispatch_date_time,
+            dispatch_date, dispatch_time, incident_type, lat, lon)
+        VALUES (%s, %s, NULLIF(%s,'')::integer, %s, %s, %s, %s, %s, %s, TIME WITHOUT TIME ZONE %s, %s, %s, %s)
+        ON CONFLICT DO NOTHING;
+        """
+        
+        # Batch and commit records
         for record in records:
-            self.loadRecord(record)
+            if self.batch_count >= self.batch_size:
+                params = self.loadRecord(record)
+                self.dispatch_params.append(params)
+                with self.conn.cursor() as cur:
+                    execute_batch(cur, dispatch_insert, self.dispatch_params)
+
+                self.conn.commit()
+
+                self.dispatch_params = []
+                self.batch_count = 0
+
+            else:
+                params = self.loadRecord(record)
+                self.dispatch_params.append(params)
+                self.batch_count = self.batch_count + 1
+
+        # Commit any remaining records if batch not full
+        with self.conn.cursor() as cur:
+            execute_batch(cur, dispatch_insert, self.dispatch_params)
+
+        self.conn.commit()
+
+        self.batch_count = 0
+        self.dispatch_params = []
 
         return True
 
     def loadMostRecent(self,url):
+        """ To implement, need to query based on date from API"""
         sql = 'select max(dispatch_date_time) from dispatch;'
         pass
 
@@ -174,44 +177,35 @@ class client:
 
         # Process JSON records
         _id = entry['_id']
-        event_num = "'" + entry['Event_Number'].strip() + "'"
+        event_num = entry['Event_Number'].strip()
         street_num = entry['StreetNum'].strip()
-        street_name = "'" + entry['StreetName'].strip() + "'"
+        street_name = entry['StreetName'].strip()
 
         if '&' in entry['Full_Address']:
         	lst = entry['Full_Address'].strip().split('&')
         	addy_geocode = ' %26 '.join(lst)
-        	full_address = "'" + ' & '.join(lst) + "'"
+        	full_address = ' & '.join(lst)
         else: 
         	addy_geocode = entry['Full_Address'].strip()
-        	full_address = "'" + addy_geocode + "'"
+        	full_address = addy_geocode
         
-        city = "'" + entry['City'].strip() + "'"
+        city = entry['City'].strip()
         
         if entry['Reporting_District'] is None:
-        	district = 'NULL'
+        	district = None
         else: 
-        	district = "'" + entry['Reporting_District'].strip() + "'"
+        	district = entry['Reporting_District'].strip()
         
-        date_time = "'" + entry['Dispatch_Date_Time'].strip() + "'"
-        dispatch_date = "'" + entry['Dispatch_Date'].strip() + "'"
-        dispatch_time = "'" + entry['Dispatch_Time'].strip() + "'"
-        incident_type = "'" + entry['Incident_Type_Desc_Display'].strip() + "'"
-        #print(addy_geocode, full_address,city)
+        date_time = entry['Dispatch_Date_Time'].strip()
+        dispatch_date = entry['Dispatch_Date'].strip()
+        dispatch_time = entry['Dispatch_Time'].strip()
+        incident_type = entry['Incident_Type_Desc_Display'].strip()
 
         lat, lon = geo_output = self.getLatLong(addy_geocode, entry['City'].strip())
-        #print(lat, lon)
 
-        dispatch_insert = """
-        INSERT INTO dispatch (_id, event_number, street_num, street_name, full_address, city, reporting_district, dispatch_date_time,
-            dispatch_date, dispatch_time, incident_type, lat, lon)
-        VALUES ({}, {}, NULLIF('{}','')::integer, {}, {}, {}, {}, {}, {}, TIME WITHOUT TIME ZONE {}, {}, {}, {})
-        ON CONFLICT DO NOTHING;
-        """.format(_id, event_num, street_num, street_name, full_address, city, district, date_time, dispatch_date, dispatch_time, incident_type, lat, lon)
+        dispatch_params = (_id, event_num, street_num, street_name, full_address, city, district, date_time, dispatch_date, dispatch_time, incident_type, lat, lon)
 
-        self.write([dispatch_insert])
-
-        return True
+        return dispatch_params
 
     def getLatLong(self, address, city):
         urlbase = 'https://geocoding.geo.census.gov/geocoder/locations/onelineaddress?address='
@@ -219,7 +213,6 @@ class client:
         url_address = address + ', ' + city + ' IL' 
     	
         full_url = urlbase+url_address+output_format
-        #print(full_url)
         fileobj = urllib.request.urlopen(full_url)
         data=json.load(fileobj)
 
@@ -228,7 +221,7 @@ class client:
             lat = data['result']['addressMatches'][0]['coordinates']['y']
             return lat, lon
         else:
-        	return 'NULL', 'NULL'
+        	return None, None
 
 
 
