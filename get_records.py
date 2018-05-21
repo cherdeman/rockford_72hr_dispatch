@@ -223,6 +223,17 @@ class client:
         else:
         	return None, None
 
+def main():
+    db = client()
+
+    db.openConnection()
+    db.loadAll(url)
+    db.closeConnection()
+
+    print("database records have been updated")
+
+if __name__== "__main__":
+    main()
 
 
 
